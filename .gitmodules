@@ -1,3 +1,3 @@
 [submodule "pytorch_extension_example"]
 	path = pytorch_extension_example
-	url = ./pytorch_extension_example/
+	url = git@github.com:ucas-ict-weak-chicken/pytorch_extension_example.git

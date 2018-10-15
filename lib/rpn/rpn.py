@@ -1,13 +1,14 @@
 from torchvision.models import vgg16
 from torch import nn
 import torch.nn.functional as F
+from torch.autograd import Variable
 import torch
 import numpy as np
 from utils.config import cfg
 from .generate_anchors import generate_anchors
-from .bbox_transform import bbox_transform_inv, clip_boxes
+from .bbox_transform import bbox_transform_inv, clip_boxes, bbox_overlaps_batch, bbox_transform_batch
 from nms.nms_wrapper import nms
-
+from utils.net_utils import _smooth_l1_loss
 
 class ProposalLayer(nn.Module):
     def __init__(self, feat_stride, scales, ratios):
@@ -128,14 +129,15 @@ class AnchorTargetLayer(nn.Module):
             generate 9 anchor boxes centered on cell i
             apply predicted bbox deltas at cell i to each of the 9 anchors
         filter out-of-image anchors
+
         Args:
             rpn_cls_score(torch.Tensor): [B, 2, H, W]
-            gt_boxes:
-            im_info:
-            num_boxes:
+            gt_boxes(torch.Tensor): [B, K, 4] Where K is the max box of an image
+            im_info(torch.Tensor): [B, 2] width and height of image
+            num_boxes(int): num of boxes
 
         Returns:
-
+            list[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: labels(B, 1, AH, W), bbox target(B, A, H, W), inside weights(B, A, H, W), outside weights(B, A, H, W)
         """
         height, width = rpn_cls_score.size(2), rpn_cls_score.size(3)
         batch_size = gt_boxes.size(0)
@@ -174,6 +176,148 @@ class AnchorTargetLayer(nn.Module):
         bbox_outside_weights = gt_boxes.new(batch_size, inds_inside.size(0)).zero_()
 
         overlaps = bbox_overlaps_batch(anchors, gt_boxes)
+
+        max_overlaps, argmax_overlaps = torch.max(overlaps, 2)  # 锚框对真实框取最大
+        gt_max_overlaps, _ = torch.max(overlaps, 1)  # 真实框对锚框取最大
+
+
+        # 如果映射到锚框上的IoU最大的gt依然小于阈值，对应锚框label为0
+        if not cfg.TRAIN.RPN_CLOBBER_POSITIVES:
+            labels[max_overlaps < cfg.TRAIN.RPN_NEGATIVE_OVERLAP] = 0
+
+
+
+        gt_max_overlaps[gt_max_overlaps==0] = 1e-5
+
+        # 一个锚框对应的最大真实框的数量
+        # TODO: 这种方式效率太低了吧
+        keep = torch.sum(overlaps.eq(gt_max_overlaps.view(batch_size,1,-1).expand_as(overlaps)), 2)
+        if torch.sum(keep) > 0:
+            labels[keep>0] = 1
+
+        # 锚框对应的最大真实框大于一定阈值
+        labels[max_overlaps >= cfg.TRAIN.RPN_POSITIVE_OVERLAP] = 1
+
+        if cfg.TRAIN.RPN_CLOBBER_POSITIVES:
+            labels[max_overlaps < cfg.TRAIN.RPN_NEGATIVE_OVERLAP] = 0
+
+        num_fg = int(cfg.TRAIN.RPN_FG_FRACTION * cfg.TRAIN.RPN_BATCHSIZE)
+        sum_fg = torch.sum((labels == 1).int(), 1)
+        sum_bg = torch.sum((labels == 0).int(), 1)
+
+        for i in range(batch_size):
+            # 忽略多余的正例
+            if sum_fg[i] > num_fg:
+                fg_inds = torch.nonzero(labels[i] == 1).view(-1)
+                rand_num = torch.from_numpy(np.random.permutation(fg_inds.size(0))).type_as(gt_boxes).long()
+                disable_inds = fg_inds[rand_num[:fg_inds.size(0)-num_fg]]
+                labels[i][disable_inds] = -1
+
+            num_bg = cfg.TRAIN.RPN_BATCHSIZE - torch.sum((labels == 1).int(), 1)[i]
+
+            # 忽略多余的负例
+            if sum_bg[i] > num_bg:
+                bg_inds = torch.nonzero(labels[i] == 0).view(-1)
+                rand_num = torch.from_numpy(np.random.permutation(bg_inds.size(0)))
+                disable_inds = bg_inds[rand_num[:bg_inds.size(0)-num_bg]]
+                labels[i][disable_inds] = -1
+
+        offset = torch.arange(0, batch_size) * gt_boxes.size(1)
+
+        argmax_overlaps = argmax_overlaps + offset.view(batch_size, 1).type_as(argmax_overlaps)
+
+        # [B, A, 4] regression box.
+        bbox_targets = _compute_targets_batch(anchors, gt_boxes.view(-1,5)[argmax_overlaps.view(-1), :].view(batch_size, -1, 5))
+
+        bbox_inside_weights[labels==1] = cfg.TRAIN.RPN_BBOX_INSIDE_WEIGHTS[0]
+
+        if cfg.TRAIN.RPN_POSITIVE_WEIGHT < 0:
+            num_examples = torch.sum(labels[i] >= 0)
+            positive_weights = 1.0 / num_examples.item()
+            negative_weights = 1.0 / num_examples.item()
+        else:
+            assert (
+                (cfg.TRAIN.RPN_POSITIVE_WEIGHT > 0) &
+                (cfg.TRAIN.RPN_POSITIVE_WEIGHT < 1)
+            )
+
+        bbox_outside_weights[labels == 1] = positive_weights
+        bbox_outside_weights[labels == 0] = negative_weights
+
+        # 去除图片外的边框
+        labels = _unmap(labels, total_anchors, inds_inside, batch_size, fill=0)
+        bbox_targets = _unmap(bbox_targets, total_anchors, inds_inside, batch_size, fill=0)
+        bbox_inside_weights = _unmap(bbox_inside_weights, total_anchors, inds_inside, batch_size, fill=0)
+        bbox_outside_weights = _unmap(bbox_outside_weights, total_anchors, inds_inside, batch_size, fill=0)
+
+        outputs = []
+
+        labels = labels.view(batch_size, height, width, A).permute(0, 3, 1, 2).contiguous()
+
+        #TODO: Check why
+        labels = labels.view(batch_size, 1, A*height, width)
+        outputs.append(labels)
+
+        bbox_targets = bbox_targets.view(batch_size, height, width, A).permute(0, 3, 1, 2).contiguous()
+        outputs.append(bbox_targets)
+
+        anchors_count = bbox_inside_weights.size(1)
+        bbox_inside_weights = bbox_inside_weights.view(batch_size, anchors_count, 1).expand(batch_size, anchors_count, 4)
+
+        bbox_inside_weights = bbox_inside_weights.contiguous().view(batch_size, height, width, 4*A)\
+                                .permute(0,3,1,2).contiguous()
+        outputs.append(bbox_inside_weights)
+
+        bbox_outside_weights = bbox_outside_weights.view(batch_size,anchors_count,1).expand(batch_size, anchors_count, 4)
+        bbox_outside_weights = bbox_outside_weights.contiguous().view(batch_size, height, width, 4*A)\
+                            .permute(0,3,1,2).contiguous()
+        outputs.append(bbox_outside_weights)
+
+
+        return outputs
+
+    def backward(self):
+        pass
+
+
+
+
+def _compute_targets_batch(ex_rois, gt_rois):
+    """
+    将真实框转化成回归框
+    Args:
+        ex_rois(torch.Tensor): [A, 4] anchors
+        gt_rois(torch.Tensor): [B, A, 5] max gt boxes
+
+    Returns:
+        torch.Tensor: [B, A, 4]
+    """
+    return bbox_transform_batch(ex_rois, gt_rois[:, :, :4])
+
+
+def _unmap(data, count, inds, batch_size, fill=0):
+    """
+    取出data[inds]到内存中，不够的补0.
+
+    Args:
+        data(torch.Tensor): 原始数据，二维或三维
+        count(int): 切片后最大长度
+        inds(torch.Tensor): 下标信息
+        batch_size(int): bs
+        fill(int): 不够长度补fill
+
+    Returns:
+        torch.Tensor: [B, count, *]
+    """
+    if data.dim() == 2:
+        ret = torch.Tensor(batch_size, count).fill_(fill).type_as(data)
+        ret[:, inds] = data
+    else:
+        ret = torch.Tensor(batch_size, count, data.size(2)).fill_(fill).type_as(data)
+        ret[:, inds, :] = data
+    return ret
+
+
 
 
 
@@ -236,11 +380,11 @@ class RPN(nn.Module):
         Args:
             base_feat(torch.Tensor): [B, C, H, W],feature map of basenet
             im_info(torch.Tensor): [B, 2] width and height of image.
-            gt_boxes:
-            num_boxes:
+            gt_boxes(torch.Tensor): [B, K, 4] Where K is the max box of an image
+            num_boxes(int):
 
         Returns:
-
+            rois, rpn_loss_cls and rpn_loss_box
         """
         batch_size = base_feat.size(0)
 
@@ -264,4 +408,26 @@ class RPN(nn.Module):
         # generating training labels and build the rpn loss
         if self.training:
             assert gt_boxes is not None
+
+            # rpn_cls_score只用了形状信息
             rpn_data = self.RPN_anchor_target(rpn_cls_score.data, gt_boxes, im_info, num_boxes)
+
+            rpn_cls_score = rpn_cls_score_reshape.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 2)
+            rpn_label = rpn_data[0].view(batch_size, -1)
+
+            rpn_keep = Variable(rpn_label.view(-1).ne(-1).nonzero().view(-1))
+            rpn_cls_score = torch.index_select(rpn_cls_score.view(-1, 2), 0, rpn_keep)
+            rpn_label = torch.index_select(rpn_label.view(-1), 0, rpn_keep.data)
+            rpn_label = Variable(rpn_label.long())
+            self.rpn_loss_cls = F.cross_entropy(rpn_cls_score, rpn_label)
+            fg_cnt = torch.sum(rpn_label.data.ne(0))
+
+            rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = rpn_data[1:]
+
+            rpn_bbox_inside_weights = Variable(rpn_bbox_inside_weights)
+            rpn_bbox_outside_weights = Variable(rpn_bbox_outside_weights)
+            rpn_bbox_targets = Variable(rpn_bbox_targets)
+
+            self.rpn_loss_box = _smooth_l1_loss(rpn_bbox_pred, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights, sigma=3, dim=[1,2,3])
+
+            return rois, self.rpn_loss_cls, self.rpn_loss_box

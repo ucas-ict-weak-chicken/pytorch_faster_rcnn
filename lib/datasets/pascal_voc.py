@@ -17,7 +17,7 @@ import pickle
 import subprocess
 import uuid
 from .voc_eval import voc_eval
-from fast_rcnn.config import cfg
+from faster_rcnn.config import cfg
 
 class pascal_voc(imdb):
     def __init__(self, image_set, year, devkit_path=None):

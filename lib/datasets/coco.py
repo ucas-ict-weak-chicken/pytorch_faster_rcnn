@@ -6,7 +6,7 @@
 
 from datasets.imdb import imdb
 import datasets.ds_utils as ds_utils
-from fast_rcnn.config import cfg
+from faster_rcnn.config import cfg
 import os.path as osp
 import sys
 import os

@@ -1,315 +1,387 @@
-#!/usr/bin/env python
-
 # --------------------------------------------------------
-# Faster R-CNN
-# Copyright (c) 2015 Microsoft
+# Pytorch multi-GPU Faster R-CNN
 # Licensed under The MIT License [see LICENSE for details]
-# Written by Ross Girshick
+# Written by Jiasen Lu, Jianwei Yang, based on code from Ross Girshick
 # --------------------------------------------------------
-
-"""Train a Faster R-CNN network using alternating optimization.
-This tool implements the alternating optimization algorithm described in our
-NIPS 2015 paper ("Faster R-CNN: Towards Real-time Object Detection with Region
-Proposal Networks." Shaoqing Ren, Kaiming He, Ross Girshick, Jian Sun.)
-"""
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
 import _init_paths
-# from fast_rcnn.train import get_training_roidb, train_net
-from fast_rcnn.config import cfg, cfg_from_file, cfg_from_list, get_output_dir
-from datasets.factory import get_imdb
-# from rpn.generate import imdb_proposals
+import os
+import sys
+import numpy as np
 import argparse
 import pprint
-import numpy as np
-import sys, os
-import multiprocessing as mp
-import pickle
-import shutil
+import pdb
+import time
+
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.optim as optim
+
+import torchvision.transforms as transforms
+from torch.utils.data.sampler import Sampler
+
+from roi_data_layer.roidb import combined_roidb
+from roi_data_layer.roibatchLoader import roibatchLoader
+from utils.config import cfg, cfg_from_file, cfg_from_list, get_output_dir
+from utils.net_utils import weights_normal_init, save_net, load_net, \
+    adjust_learning_rate, save_checkpoint, clip_gradient
+
+from faster_rcnn.vgg16 import vgg16
+from faster_rcnn.resnet import resnet
+
 
 def parse_args():
     """
     Parse input arguments
     """
-    parser = argparse.ArgumentParser(description='Train a Faster R-CNN network')
-    parser.add_argument('--gpu', dest='gpu_id',
-                        help='GPU device id to use [0]',
-                        default=0, type=int)
-    parser.add_argument('--net_name', dest='net_name',
-                        help='network name (e.g., "ZF")',
-                        default=None, type=str)
-    parser.add_argument('--weights', dest='pretrained_model',
-                        help='initialize with pretrained model weights',
-                        default=None, type=str)
-    parser.add_argument('--cfg', dest='cfg_file',
-                        help='optional config file',
-                        default=None, type=str)
-    parser.add_argument('--imdb', dest='imdb_name',
-                        help='dataset to train on',
-                        default='voc_2007_trainval', type=str)
-    parser.add_argument('--set', dest='set_cfgs',
-                        help='set config keys', default=None,
-                        nargs=argparse.REMAINDER)
+    parser = argparse.ArgumentParser(description='Train a Fast R-CNN network')
+    parser.add_argument('--dataset', dest='dataset',
+                        help='training dataset',
+                        default='pascal_voc', type=str)
+    parser.add_argument('--net', dest='net',
+                        help='vgg16, res101',
+                        default='vgg16', type=str)
+    parser.add_argument('--start_epoch', dest='start_epoch',
+                        help='starting epoch',
+                        default=1, type=int)
+    parser.add_argument('--epochs', dest='max_epochs',
+                        help='number of epochs to train',
+                        default=20, type=int)
+    parser.add_argument('--disp_interval', dest='disp_interval',
+                        help='number of iterations to display',
+                        default=100, type=int)
+    parser.add_argument('--checkpoint_interval', dest='checkpoint_interval',
+                        help='number of iterations to display',
+                        default=10000, type=int)
 
-    # if len(sys.argv) == 1:
-    #     parser.print_help()
-    #     sys.exit(1)
+    parser.add_argument('--save_dir', dest='save_dir',
+                        help='directory to save models', default="models",
+                        type=str)
+    parser.add_argument('--nw', dest='num_workers',
+                        help='number of worker to load data',
+                        default=0, type=int)
+    parser.add_argument('--cuda', dest='cuda',
+                        help='whether use CUDA',
+                        action='store_true')
+    parser.add_argument('--ls', dest='large_scale',
+                        help='whether use large imag scale',
+                        action='store_true')
+    parser.add_argument('--mGPUs', dest='mGPUs',
+                        help='whether use multiple GPUs',
+                        action='store_true')
+    parser.add_argument('--bs', dest='batch_size',
+                        help='batch_size',
+                        default=1, type=int)
+    parser.add_argument('--cag', dest='class_agnostic',
+                        help='whether perform class_agnostic bbox regression',
+                        action='store_true')
+
+    # config optimization
+    parser.add_argument('--o', dest='optimizer',
+                        help='training optimizer',
+                        default="sgd", type=str)
+    parser.add_argument('--lr', dest='lr',
+                        help='starting learning rate',
+                        default=0.001, type=float)
+    parser.add_argument('--lr_decay_step', dest='lr_decay_step',
+                        help='step to do learning rate decay, unit is epoch',
+                        default=5, type=int)
+    parser.add_argument('--lr_decay_gamma', dest='lr_decay_gamma',
+                        help='learning rate decay ratio',
+                        default=0.1, type=float)
+
+    # set training session
+    parser.add_argument('--s', dest='session',
+                        help='training session',
+                        default=1, type=int)
+
+    # resume trained model
+    parser.add_argument('--r', dest='resume',
+                        help='resume checkpoint or not',
+                        default=False, type=bool)
+    parser.add_argument('--checksession', dest='checksession',
+                        help='checksession to load model',
+                        default=1, type=int)
+    parser.add_argument('--checkepoch', dest='checkepoch',
+                        help='checkepoch to load model',
+                        default=1, type=int)
+    parser.add_argument('--checkpoint', dest='checkpoint',
+                        help='checkpoint to load model',
+                        default=0, type=int)
+    # log and diaplay
+    parser.add_argument('--use_tfb', dest='use_tfboard',
+                        help='whether use tensorboard',
+                        action='store_true')
 
     args = parser.parse_args()
     return args
 
-def get_roidb(imdb_name, rpn_file=None):
-    imdb = get_imdb(imdb_name)
-    print('Loaded dataset `{:s}` for training'.format(imdb.name))
-    imdb.set_proposal_method(cfg.TRAIN.PROPOSAL_METHOD)
-    print('Set proposal method: {:s}'.format(cfg.TRAIN.PROPOSAL_METHOD))
-    if rpn_file is not None:
-        imdb.config['rpn_file'] = rpn_file
-    roidb = get_training_roidb(imdb)
-    return roidb, imdb
 
-def get_solvers(net_name):
-    # Faster R-CNN Alternating Optimization
-    n = 'faster_rcnn_alt_opt'
-    # Solver for each training stage
-    solvers = [[net_name, n, 'stage1_rpn_solver60k80k.pt'],
-               [net_name, n, 'stage1_fast_rcnn_solver30k40k.pt'],
-               [net_name, n, 'stage2_rpn_solver60k80k.pt'],
-               [net_name, n, 'stage2_fast_rcnn_solver30k40k.pt']]
-    solvers = [os.path.join(cfg.MODELS_DIR, *s) for s in solvers]
-    # Iterations for each training stage
-    max_iters = [80000, 40000, 80000, 40000]
-    # max_iters = [100, 100, 100, 100]
-    # Test prototxt for the RPN
-    rpn_test_prototxt = os.path.join(
-        cfg.MODELS_DIR, net_name, n, 'rpn_test.pt')
-    return solvers, max_iters, rpn_test_prototxt
+class sampler(Sampler):
+    def __init__(self, train_size, batch_size):
+        self.num_data = train_size
+        self.num_per_batch = int(train_size / batch_size)
+        self.batch_size = batch_size
+        self.range = torch.arange(0, batch_size).view(1, batch_size).long()
+        self.leftover_flag = False
+        if train_size % batch_size:
+            self.leftover = torch.arange(self.num_per_batch * batch_size, train_size).long()
+            self.leftover_flag = True
 
+    def __iter__(self):
+        rand_num = torch.randperm(self.num_per_batch).view(-1, 1) * self.batch_size
+        self.rand_num = rand_num.expand(self.num_per_batch, self.batch_size) + self.range
 
-def train_rpn(queue=None, imdb_name=None, init_model=None, solver=None,
-              max_iters=None, cfg=None):
-    """Train a Region Proposal Network in a separate training process.
-    """
+        self.rand_num_view = self.rand_num.view(-1)
 
-    # Not using any proposals, just ground-truth boxes
-    cfg.TRAIN.HAS_RPN = True
-    cfg.TRAIN.BBOX_REG = False  # applies only to Fast R-CNN bbox regression
-    cfg.TRAIN.PROPOSAL_METHOD = 'gt'
-    cfg.TRAIN.IMS_PER_BATCH = 1
-    print('Init model: {}'.format(init_model))
-    print('Using config:')
-    pprint.pprint(cfg)
+        if self.leftover_flag:
+            self.rand_num_view = torch.cat((self.rand_num_view, self.leftover), 0)
 
+        return iter(self.rand_num_view)
 
-    roidb, imdb = get_roidb(imdb_name)
-    print('roidb len: {}'.format(len(roidb)))
-    output_dir = get_output_dir(imdb)
-    print('Output will be saved to `{:s}`'.format(output_dir))
+    def __len__(self):
+        return self.num_data
 
-    model_paths = train_net(solver, roidb, output_dir,
-                            pretrained_model=init_model,
-                            max_iters=max_iters)
-    # Cleanup all but the final model
-    for i in model_paths[:-1]:
-        os.remove(i)
-    rpn_model_path = model_paths[-1]
-    # Send final model path through the multiprocessing queue
-    queue.put({'model_path': rpn_model_path})
-
-def rpn_generate(queue=None, imdb_name=None, rpn_model_path=None, cfg=None,
-                 rpn_test_prototxt=None):
-    """Use a trained RPN to generate proposals.
-    """
-
-    cfg.TEST.RPN_PRE_NMS_TOP_N = -1     # no pre NMS filtering
-    cfg.TEST.RPN_POST_NMS_TOP_N = 2000  # limit top boxes after NMS
-    print('RPN model: {}'.format(rpn_model_path))
-    print('Using config:')
-    pprint.pprint(cfg)
-
-    # import caffe
-    # _init_caffe(cfg)
-
-    # NOTE: the matlab implementation computes proposals on flipped images, too.
-    # We compute them on the image once and then flip the already computed
-    # proposals. This might cause a minor loss in mAP (less proposal jittering).
-    imdb = get_imdb(imdb_name)
-    print('Loaded dataset `{:s}` for proposal generation'.format(imdb.name))
-
-    # Load RPN and configure output directory
-    rpn_net = caffe.Net(rpn_test_prototxt, rpn_model_path, caffe.TEST)
-    output_dir = get_output_dir(imdb)
-    print('Output will be saved to `{:s}`'.format(output_dir))
-    # Generate proposals on the imdb
-    rpn_proposals = imdb_proposals(rpn_net, imdb)
-    # Write proposals to disk and send the proposal file path through the
-    # multiprocessing queue
-    rpn_net_name = os.path.splitext(os.path.basename(rpn_model_path))[0]
-    rpn_proposals_path = os.path.join(
-        output_dir, rpn_net_name + '_proposals.pkl')
-    with open(rpn_proposals_path, 'wb') as f:
-        pickle.dump(rpn_proposals, f, pickle.HIGHEST_PROTOCOL)
-    print('Wrote RPN proposals to {}'.format(rpn_proposals_path))
-    queue.put({'proposal_path': rpn_proposals_path})
-
-def train_fast_rcnn(queue=None, imdb_name=None, init_model=None, solver=None,
-                    max_iters=None, cfg=None, rpn_file=None):
-    """Train a Fast R-CNN using proposals generated by an RPN.
-    """
-
-    cfg.TRAIN.HAS_RPN = False           # not generating prosals on-the-fly
-    cfg.TRAIN.PROPOSAL_METHOD = 'rpn'   # use pre-computed RPN proposals instead
-    cfg.TRAIN.IMS_PER_BATCH = 2
-    print('Init model: {}'.format(init_model))
-    print('RPN proposals: {}'.format(rpn_file))
-    print('Using config:')
-    pprint.pprint(cfg)
-
-    import caffe
-    _init_caffe(cfg)
-
-    roidb, imdb = get_roidb(imdb_name, rpn_file=rpn_file)
-    output_dir = get_output_dir(imdb)
-    print('Output will be saved to `{:s}`'.format(output_dir))
-    # Train Fast R-CNN
-    model_paths = train_net(solver, roidb, output_dir,
-                            pretrained_model=init_model,
-                            max_iters=max_iters)
-    # Cleanup all but the final model
-    for i in model_paths[:-1]:
-        os.remove(i)
-    fast_rcnn_model_path = model_paths[-1]
-    # Send Fast R-CNN model path over the multiprocessing queue
-    queue.put({'model_path': fast_rcnn_model_path})
 
 if __name__ == '__main__':
+
     args = parse_args()
 
     print('Called with args:')
     print(args)
 
+    if args.dataset == "pascal_voc":
+        args.imdb_name = "voc_2007_trainval"
+        args.imdbval_name = "voc_2007_test"
+        args.set_cfgs = ['ANCHOR_SCALES', '[8, 16, 32]', 'ANCHOR_RATIOS', '[0.5,1,2]', 'MAX_NUM_GT_BOXES', '20']
+    elif args.dataset == "pascal_voc_0712":
+        args.imdb_name = "voc_2007_trainval+voc_2012_trainval"
+        args.imdbval_name = "voc_2007_test"
+        args.set_cfgs = ['ANCHOR_SCALES', '[8, 16, 32]', 'ANCHOR_RATIOS', '[0.5,1,2]', 'MAX_NUM_GT_BOXES', '20']
+    elif args.dataset == "coco":
+        args.imdb_name = "coco_2014_train+coco_2014_valminusminival"
+        args.imdbval_name = "coco_2014_minival"
+        args.set_cfgs = ['ANCHOR_SCALES', '[4, 8, 16, 32]', 'ANCHOR_RATIOS', '[0.5,1,2]', 'MAX_NUM_GT_BOXES', '50']
+    elif args.dataset == "imagenet":
+        args.imdb_name = "imagenet_train"
+        args.imdbval_name = "imagenet_val"
+        args.set_cfgs = ['ANCHOR_SCALES', '[4, 8, 16, 32]', 'ANCHOR_RATIOS', '[0.5,1,2]', 'MAX_NUM_GT_BOXES', '30']
+    elif args.dataset == "vg":
+        # train sizes: train, smalltrain, minitrain
+        # train scale: ['150-50-20', '150-50-50', '500-150-80', '750-250-150', '1750-700-450', '1600-400-20']
+        args.imdb_name = "vg_150-50-50_minitrain"
+        args.imdbval_name = "vg_150-50-50_minival"
+        args.set_cfgs = ['ANCHOR_SCALES', '[4, 8, 16, 32]', 'ANCHOR_RATIOS', '[0.5,1,2]', 'MAX_NUM_GT_BOXES', '50']
+
+    args.cfg_file = "cfgs/{}_ls.yml".format(args.net) if args.large_scale else "cfgs/{}.yml".format(args.net)
+
     if args.cfg_file is not None:
         cfg_from_file(args.cfg_file)
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs)
-    cfg.GPU_ID = args.gpu_id
 
-    # --------------------------------------------------------------------------
-    # Pycaffe doesn't reliably free GPU memory when instantiated nets are
-    # discarded (e.g. "del net" in Python code). To work around this issue, each
-    # training stage is executed in a separate process using
-    # multiprocessing.Process.
-    # --------------------------------------------------------------------------
+    print('Using config:')
+    pprint.pprint(cfg)
+    np.random.seed(cfg.RNG_SEED)
 
-    # queue for communicated results between processes
-    mp_queue = mp.Queue()
-    # solves, iters, etc. for each training stage
-    solvers, max_iters, rpn_test_prototxt = get_solvers(args.net_name)
+    # torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available() and not args.cuda:
+        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
 
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-    print('Stage 1 RPN, init from ImageNet model')
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    # train set
+    # -- Note: Use validation set and disable the flipped to enable faster loading.
+    cfg.TRAIN.USE_FLIPPED = True
+    cfg.USE_GPU_NMS = args.cuda
+    imdb, roidb, ratio_list, ratio_index = combined_roidb(args.imdb_name)
+    train_size = len(roidb)
 
-    cfg.TRAIN.SNAPSHOT_INFIX = 'stage1'
-    mp_kwargs = dict(
-            queue=mp_queue,
-            imdb_name=args.imdb_name,
-            init_model=args.pretrained_model,
-            solver=solvers[0],
-            max_iters=max_iters[0],
-            cfg=cfg)
-    p = mp.Process(target=train_rpn, kwargs=mp_kwargs)
-    p.start()
-    rpn_stage1_out = mp_queue.get()
-    p.join()
+    print('{:d} roidb entries'.format(len(roidb)))
 
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-    print('Stage 1 RPN, generate proposals')
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    output_dir = args.save_dir + "/" + args.net + "/" + args.dataset
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    mp_kwargs = dict(
-            queue=mp_queue,
-            imdb_name=args.imdb_name,
-            rpn_model_path=str(rpn_stage1_out['model_path']),
-            cfg=cfg,
-            rpn_test_prototxt=rpn_test_prototxt)
-    p = mp.Process(target=rpn_generate, kwargs=mp_kwargs)
-    p.start()
-    rpn_stage1_out['proposal_path'] = mp_queue.get()['proposal_path']
-    p.join()
+    sampler_batch = sampler(train_size, args.batch_size)
 
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-    print('Stage 1 Fast R-CNN using RPN proposals, init from ImageNet model')
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    dataset = roibatchLoader(roidb, ratio_list, ratio_index, args.batch_size, \
+                             imdb.num_classes, training=True)
 
-    cfg.TRAIN.SNAPSHOT_INFIX = 'stage1'
-    mp_kwargs = dict(
-            queue=mp_queue,
-            imdb_name=args.imdb_name,
-            init_model=args.pretrained_model,
-            solver=solvers[1],
-            max_iters=max_iters[1],
-            cfg=cfg,
-            rpn_file=rpn_stage1_out['proposal_path'])
-    p = mp.Process(target=train_fast_rcnn, kwargs=mp_kwargs)
-    p.start()
-    fast_rcnn_stage1_out = mp_queue.get()
-    p.join()
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size,
+                                             sampler=sampler_batch, num_workers=args.num_workers)
 
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-    print('Stage 2 RPN, init from stage 1 Fast R-CNN model')
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    # initilize the tensor holder >here.
+    im_data = torch.FloatTensor(1)
+    im_info = torch.FloatTensor(1)
+    num_boxes = torch.LongTensor(1)
+    gt_boxes = torch.FloatTensor(1)
 
-    cfg.TRAIN.SNAPSHOT_INFIX = 'stage2'
-    mp_kwargs = dict(
-            queue=mp_queue,
-            imdb_name=args.imdb_name,
-            init_model=str(fast_rcnn_stage1_out['model_path']),
-            solver=solvers[2],
-            max_iters=max_iters[2],
-            cfg=cfg)
-    p = mp.Process(target=train_rpn, kwargs=mp_kwargs)
-    p.start()
-    rpn_stage2_out = mp_queue.get()
-    p.join()
+    # ship to cuda
+    if args.cuda:
+        im_data = im_data.cuda()
+        im_info = im_info.cuda()
+        num_boxes = num_boxes.cuda()
+        gt_boxes = gt_boxes.cuda()
 
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-    print('Stage 2 RPN, generate proposals')
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    # make variable
+    im_data = Variable(im_data)
+    im_info = Variable(im_info)
+    num_boxes = Variable(num_boxes)
+    gt_boxes = Variable(gt_boxes)
 
-    mp_kwargs = dict(
-            queue=mp_queue,
-            imdb_name=args.imdb_name,
-            rpn_model_path=str(rpn_stage2_out['model_path']),
-            cfg=cfg,
-            rpn_test_prototxt=rpn_test_prototxt)
-    p = mp.Process(target=rpn_generate, kwargs=mp_kwargs)
-    p.start()
-    rpn_stage2_out['proposal_path'] = mp_queue.get()['proposal_path']
-    p.join()
+    if args.cuda:
+        cfg.CUDA = True
 
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-    print('Stage 2 Fast R-CNN, init from stage 2 RPN R-CNN model')
-    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    # initilize the network here.
+    if args.net == 'vgg16':
+        fasterRCNN = vgg16(imdb.classes, pretrained=True, class_agnostic=args.class_agnostic)
+    elif args.net == 'res101':
+        fasterRCNN = resnet(imdb.classes, 101, pretrained=True, class_agnostic=args.class_agnostic)
+    elif args.net == 'res50':
+        fasterRCNN = resnet(imdb.classes, 50, pretrained=True, class_agnostic=args.class_agnostic)
+    elif args.net == 'res152':
+        fasterRCNN = resnet(imdb.classes, 152, pretrained=True, class_agnostic=args.class_agnostic)
+    else:
+        print("network is not defined")
+        pdb.set_trace()
 
-    cfg.TRAIN.SNAPSHOT_INFIX = 'stage2'
-    mp_kwargs = dict(
-            queue=mp_queue,
-            imdb_name=args.imdb_name,
-            init_model=str(rpn_stage2_out['model_path']),
-            solver=solvers[3],
-            max_iters=max_iters[3],
-            cfg=cfg,
-            rpn_file=rpn_stage2_out['proposal_path'])
-    p = mp.Process(target=train_fast_rcnn, kwargs=mp_kwargs)
-    p.start()
-    fast_rcnn_stage2_out = mp_queue.get()
-    p.join()
+    fasterRCNN.create_architecture()
 
-    # Create final model (just a copy of the last stage)
-    final_path = os.path.join(
-            os.path.dirname(fast_rcnn_stage2_out['model_path']),
-            args.net_name + '_faster_rcnn_final.caffemodel')
-    print('cp {} -> {}'.format(
-            fast_rcnn_stage2_out['model_path'], final_path))
-    shutil.copy(fast_rcnn_stage2_out['model_path'], final_path)
-    print('Final model: {}'.format(final_path))
+    lr = cfg.TRAIN.LEARNING_RATE
+    lr = args.lr
+    # tr_momentum = cfg.TRAIN.MOMENTUM
+    # tr_momentum = args.momentum
+
+    params = []
+    for key, value in dict(fasterRCNN.named_parameters()).items():
+        if value.requires_grad:
+            if 'bias' in key:
+                params += [{'params': [value], 'lr': lr * (cfg.TRAIN.DOUBLE_BIAS + 1), \
+                            'weight_decay': cfg.TRAIN.BIAS_DECAY and cfg.TRAIN.WEIGHT_DECAY or 0}]
+            else:
+                params += [{'params': [value], 'lr': lr, 'weight_decay': cfg.TRAIN.WEIGHT_DECAY}]
+
+    if args.optimizer == "adam":
+        lr = lr * 0.1
+        optimizer = torch.optim.Adam(params)
+
+    elif args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(params, momentum=cfg.TRAIN.MOMENTUM)
+
+    if args.resume:
+        load_name = os.path.join(output_dir,
+                                 'faster_rcnn_{}_{}_{}.pth'.format(args.checksession, args.checkepoch, args.checkpoint))
+        print("loading checkpoint %s" % (load_name))
+        checkpoint = torch.load(load_name)
+        args.session = checkpoint['session']
+        args.start_epoch = checkpoint['epoch']
+        fasterRCNN.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        lr = optimizer.param_groups[0]['lr']
+        if 'pooling_mode' in checkpoint.keys():
+            cfg.POOLING_MODE = checkpoint['pooling_mode']
+        print("loaded checkpoint %s" % (load_name))
+
+    if args.mGPUs:
+        fasterRCNN = nn.DataParallel(fasterRCNN)
+
+    if args.cuda:
+        fasterRCNN.cuda()
+
+    iters_per_epoch = int(train_size / args.batch_size)
+
+    if args.use_tfboard:
+        from tensorboardX import SummaryWriter
+
+        logger = SummaryWriter("logs")
+
+    for epoch in range(args.start_epoch, args.max_epochs + 1):
+        # setting to train mode
+        fasterRCNN.train()
+        loss_temp = 0
+        start = time.time()
+
+        if epoch % (args.lr_decay_step + 1) == 0:
+            adjust_learning_rate(optimizer, args.lr_decay_gamma)
+            lr *= args.lr_decay_gamma
+
+        data_iter = iter(dataloader)
+        for step in range(iters_per_epoch):
+            data = next(data_iter)
+            im_data.data.resize_(data[0].size()).copy_(data[0])
+            im_info.data.resize_(data[1].size()).copy_(data[1])
+            gt_boxes.data.resize_(data[2].size()).copy_(data[2])
+            num_boxes.data.resize_(data[3].size()).copy_(data[3])
+
+            fasterRCNN.zero_grad()
+            rois, cls_prob, bbox_pred, \
+            rpn_loss_cls, rpn_loss_box, \
+            RCNN_loss_cls, RCNN_loss_bbox, \
+            rois_label = fasterRCNN(im_data, im_info, gt_boxes, num_boxes)
+
+            loss = rpn_loss_cls.mean() + rpn_loss_box.mean() \
+                   + RCNN_loss_cls.mean() + RCNN_loss_bbox.mean()
+            loss_temp += loss.item()
+
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+            if args.net == "vgg16":
+                clip_gradient(fasterRCNN, 10.)
+            optimizer.step()
+
+            if step % args.disp_interval == 0:
+                end = time.time()
+                if step > 0:
+                    loss_temp /= (args.disp_interval + 1)
+
+                if args.mGPUs:
+                    loss_rpn_cls = rpn_loss_cls.mean().item()
+                    loss_rpn_box = rpn_loss_box.mean().item()
+                    loss_rcnn_cls = RCNN_loss_cls.mean().item()
+                    loss_rcnn_box = RCNN_loss_bbox.mean().item()
+                    fg_cnt = torch.sum(rois_label.data.ne(0))
+                    bg_cnt = rois_label.data.numel() - fg_cnt
+                else:
+                    loss_rpn_cls = rpn_loss_cls.item()
+                    loss_rpn_box = rpn_loss_box.item()
+                    loss_rcnn_cls = RCNN_loss_cls.item()
+                    loss_rcnn_box = RCNN_loss_bbox.item()
+                    fg_cnt = torch.sum(rois_label.data.ne(0))
+                    bg_cnt = rois_label.data.numel() - fg_cnt
+
+                print("[session %d][epoch %2d][iter %4d/%4d] loss: %.4f, lr: %.2e" \
+                      % (args.session, epoch, step, iters_per_epoch, loss_temp, lr))
+                print("\t\t\tfg/bg=(%d/%d), time cost: %f" % (fg_cnt, bg_cnt, end - start))
+                print("\t\t\trpn_cls: %.4f, rpn_box: %.4f, rcnn_cls: %.4f, rcnn_box %.4f" \
+                      % (loss_rpn_cls, loss_rpn_box, loss_rcnn_cls, loss_rcnn_box))
+                if args.use_tfboard:
+                    info = {
+                        'loss': loss_temp,
+                        'loss_rpn_cls': loss_rpn_cls,
+                        'loss_rpn_box': loss_rpn_box,
+                        'loss_rcnn_cls': loss_rcnn_cls,
+                        'loss_rcnn_box': loss_rcnn_box
+                    }
+                    logger.add_scalars("logs_s_{}/losses".format(args.session), info,
+                                       (epoch - 1) * iters_per_epoch + step)
+
+                loss_temp = 0
+                start = time.time()
+
+        save_name = os.path.join(output_dir, 'faster_rcnn_{}_{}_{}.pth'.format(args.session, epoch, step))
+        save_checkpoint({
+            'session': args.session,
+            'epoch': epoch + 1,
+            'model': fasterRCNN.module.state_dict() if args.mGPUs else fasterRCNN.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'pooling_mode': cfg.POOLING_MODE,
+            'class_agnostic': args.class_agnostic,
+        }, save_name)
+        print('save model: {}'.format(save_name))
+
+    if args.use_tfboard:
+        logger.close()
